@@ -22,9 +22,9 @@
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
-ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
-ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -335,7 +335,8 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
 # Rust toolchain already installed above (before the sglang install).
 
 # Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir "maturin<1.14" \
+RUN apt-get update && apt-get install protobuf-compiler -y \
+    && python3 -m pip install --no-cache-dir "maturin<1.14" \
     && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
            /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
     && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
@@ -559,100 +560,9 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 
 # -----------------------
 # Hot patch: torch-ROCm
-# The artifact hardcoded the supported triton version to be 3.5.1.
-# Rewrite the restriction directly.
-ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN mkdir /tmp/whl && cd /tmp/whl \
-     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
-     && cat > hack.py <<"PY"
-import zipfile, csv, os, re
-from pathlib import Path
-
-fname = os.environ["TORCH_ROCM_FILE"]
-in_whl  = Path("/")   / fname
-out_whl = Path("/tmp")/ fname
-work = Path("/tmp/whl")
-
-# 1) Extract
-with zipfile.ZipFile(in_whl, "r") as z:
-    z.extractall(work)
-
-# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
-dist_info = next(work.glob("*.dist-info"))
-meta = dist_info / "METADATA"
-txt = meta.read_text(encoding="utf-8")
-
-# Example: replace one exact requirement form.
-# Adjust the string to match what you actually see.
-pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
-txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
-if txt2 == txt:
-    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
-meta.write_text(txt2, encoding="utf-8")
-
-# 3) Hacky step: blank hash/size columns in RECORD
-record = dist_info / "RECORD"
-rows = []
-with record.open(newline="", encoding="utf-8") as f:
-    for r in csv.reader(f):
-        if not r:
-            continue
-        # keep filename, blank out hash and size
-        rows.append([r[0], "", ""])
-with record.open("w", newline="", encoding="utf-8") as f:
-    csv.writer(f).writerows(rows)
-
-# 4) Re-zip as a wheel
-with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for p in work.rglob("*"):
-        if p.is_file():
-            z.write(p, p.relative_to(work).as_posix())
-
-print("Wrote", out_whl)
-PY
-
-RUN cd /tmp/whl \
-    && case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
-        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        ;; \
-    esac
-
-# -----------------------
-# Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
-# _compute_local_source_files_hash calls Path(...).resolve() on custom-code
-# module files, following the HF-cache snapshots/<hash>/x.py -> blobs/<blob>
-# symlink. trust_remote_code models whose custom code uses relative imports
-# (e.g. Kimi-K2.6's kimi_k25_vision_processing.py: `from .media_utils import`)
-# then crash with FileNotFoundError: .../blobs/<name>.py at processor init.
-# Mirrors upstream transformers PR #46618 (merged, not yet released): drop the
-# .resolve() on the module file and its relative-import sources so the snapshot
-# .py names (not the blob targets) are used. Self-skips once transformers ships
-# the fix; fails the build loudly if the pattern is present but unpatched.
-RUN python3 - <<'PY'
-import pathlib
-import transformers.dynamic_module_utils as m
-
-MARKS = ["Path(resolved_module_file).resolve()", "Path(source_file).resolve()"]
-path = pathlib.Path(m.__file__)
-src = path.read_text()
-if not any(mark in src for mark in MARKS):
-    print("transformers dynamic_module_utils already fixed; no patch needed")
-else:
-    patched = (
-        src.replace("Path(resolved_module_file).resolve()", "Path(resolved_module_file)")
-           .replace("Path(source_file).resolve()", "Path(source_file)")
-    )
-    assert patched != src, "FATAL: transformers symlink patch matched nothing"
-    path.write_text(patched)
-    print("patched transformers dynamic_module_utils.py (symlink hash fix)")
-PY
+# The supported Triton version has been hardcoded in Pytorch as version 3.5.1.
+# Rewrite the restriction directly to METADATA file
+RUN sed -i '/Requires-Dist: triton.*/d' /opt/venv/lib/python3.10/site-packages/torch-2.9.1+rocm7.2.1.lw.gitff65f5bc.dist-info/METADATA
 
 # -----------------------
 # Install the Triton AITER pins, replacing the base image's. No version check
