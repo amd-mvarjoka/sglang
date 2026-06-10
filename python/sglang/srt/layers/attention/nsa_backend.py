@@ -362,7 +362,10 @@ class NativeSparseAttnBackend(
             )
             # Aiter mla_decode_fwd supports num_heads multiples of 16 in range [16, 128].
             # For models with fewer heads per GPU (e.g. GLM-5 64 heads / TP8 = 8), need to pad the heads to 16.
-            self.need_pad_heads = self.num_q_heads < 16
+            # Exception: num_q_heads == 8 with fp8 kv cache is natively supported and does not need padding.
+            self.need_pad_heads = self.num_q_heads < 16 and not (
+                self.num_q_heads == 8 and model_runner.kv_cache_dtype == fp8_dtype
+            )
             self.head_repeat_factor = (
                 16 // self.num_q_heads if self.num_q_heads < 16 else 1
             )
