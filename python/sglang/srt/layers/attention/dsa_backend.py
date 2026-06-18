@@ -1986,22 +1986,26 @@ class DeepseekSparseAttnBackend(
         bs: int,
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        out_dtype = torch.bfloat16
 
-        if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        o = torch.empty(
+            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+            dtype=out_dtype,
+            device=q.device,
+        )
 
         if self.need_pad_heads:
             q_kernel = q.view(
                 -1, layer.tp_q_head_num, layer.head_dim
             ).repeat_interleave(self.head_repeat_factor, dim=1)
-            o_kernel = q.new_empty(
+            o_kernel = torch.empty(
                 (
                     q.shape[0],
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
+                device=q.device,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -2046,22 +2050,26 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        out_dtype = torch.bfloat16
 
-        if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        o = torch.empty(
+            (num_tokens, layer.tp_q_head_num * layer.v_head_dim),
+            dtype=out_dtype,
+            device=q.device,
+        )
 
         if self.need_pad_heads:
             q_kernel = q.view(
                 -1, layer.tp_q_head_num, layer.head_dim
             ).repeat_interleave(self.head_repeat_factor, dim=1)
-            o_kernel = q.new_empty(
+            o_kernel = torch.empty(
                 (
                     num_tokens,
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
+                device=q.device,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
