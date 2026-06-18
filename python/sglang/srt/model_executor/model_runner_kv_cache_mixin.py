@@ -204,11 +204,12 @@ class ModelRunnerKVCacheMixin:
         ):
             return kv_cache_dim
 
-        # On HIP with TileLang backend, keep the default MLA KV cache dimension.
-        # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
+        # On HIP with TileLang or Aiter backend, keep the default MLA KV cache dimension.
+        # FP8 attention uses the raw nope(512 fp8) + rope(64 fp8) layout without per-block scales.
+        # Both backends write via set_mla_kv_buffer_triton_fp8_quant which expects this layout.
         if _is_hip and (
-            self.server_args.dsa_prefill_backend == "tilelang"
-            or self.server_args.dsa_decode_backend == "tilelang"
+            self.server_args.dsa_prefill_backend in ("tilelang", "aiter")
+            or self.server_args.dsa_decode_backend in ("tilelang", "aiter")
         ):
             return kv_cache_dim
 
