@@ -1994,6 +1994,7 @@ class DeepseekSparseAttnBackend(
         kv_indices = self.kv_indices
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
+        fp8_scale = layer.k_scale if self.kv_cache_dtype == fp8_dtype else None
         mla_decode_fwd(
             q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
@@ -2005,6 +2006,8 @@ class DeepseekSparseAttnBackend(
             metadata.max_seq_len_q,
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
+            q_scale=fp8_scale,
+            kv_scale=fp8_scale,
         )
 
         if self.need_pad_heads:
@@ -2061,6 +2064,7 @@ class DeepseekSparseAttnBackend(
         cu_seqlens_q = torch.arange(
             0, num_tokens + 1, dtype=torch.int32, device=self.device
         )
+        fp8_scale = layer.k_scale if self.kv_cache_dtype == fp8_dtype else None
         # TODO support more forward_mode
         mla_decode_fwd(
             q_kernel,
@@ -2073,6 +2077,8 @@ class DeepseekSparseAttnBackend(
             1,  # max_seq_len_q = 1 for per-token attention
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
+            q_scale=fp8_scale,
+            kv_scale=fp8_scale,
         )
 
         if self.need_pad_heads:
