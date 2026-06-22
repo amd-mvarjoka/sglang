@@ -49,6 +49,7 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
 
