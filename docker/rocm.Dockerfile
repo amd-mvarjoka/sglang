@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.4
+
 # Usage (to build SGLang ROCm docker image):
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
@@ -80,7 +82,6 @@ FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
-ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
 ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
@@ -91,12 +92,6 @@ ARG BRANCH_TYPE=remote
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
-<<<<<<< HEAD
-=======
-ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG TRITON_COMMIT="v3.6.0"
-
->>>>>>> 1ccb7c3626c34e50871eb5141c50670a4ddc095e
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
@@ -241,6 +236,7 @@ RUN git clone ${AITER_REPO} \
  && pip install -r requirements.txt
 
 RUN cd aiter \
+     && GPU_ARCH_LIST="${GPU_ARCH%-*}" \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
@@ -302,7 +298,8 @@ RUN pip uninstall -y sgl_kernel sglang
 
 # Obtain sglang source: copied from the build context (BRANCH_TYPE=local) or git clone.
 COPY --from=local_src /src /tmp/local_src
-RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+RUN GPU_ARCH_LIST="${GPU_ARCH%-*}" \
+    && if [ "$BRANCH_TYPE" = "local" ]; then \
          echo "Using local source (BRANCH_TYPE=local)."; \
          cp -r /tmp/local_src sglang; \
        else \
@@ -451,6 +448,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     exit 0; \
   fi; \
   echo "[MORI] Enabling MORI (NIC_BACKEND=${NIC_BACKEND})"; \
+  GPU_ARCH_LIST="${GPU_ARCH%-*}"; \
   \
   # Base deps for MORI build
   apt-get update && apt-get install -y --no-install-recommends \
@@ -531,7 +529,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[MORI] Done."'
 
 # -----------------------
-<<<<<<< HEAD
 # NIXL — upstream ai-dynamo/nixl KV transfer backend for PD disaggregation on ROCm.
 # Builds UCX (--with-rocm) + nixl from source by default; skip with ENABLE_NIXL=0.
 # --no-build-isolation reuses the image's ROCm torch (nixl pins torch==2.11.* as a build dep,
@@ -564,18 +561,43 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])"); \
   ln -sfn nixl_rocm "$SITE/nixl"; \
   echo "export LD_LIBRARY_PATH=/opt/ucx/lib:\${LD_LIBRARY_PATH}" >> /etc/bash.bashrc'
-=======
-# Hot patch: torch-ROCm
-# The supported Triton version has been hardcoded in Pytorch as version 3.5.1.
-# Rewrite the restriction directly to METADATA file
-RUN sed -i '/Requires-Dist: triton.*/d' /opt/venv/lib/python3.10/site-packages/torch-*dist-info/METADATA
->>>>>>> 1ccb7c3626c34e50871eb5141c50670a4ddc095e
 
 # -----------------------
 # Hot patch: torch-ROCm
 # The supported Triton version has been hardcoded in Pytorch as version 3.5.1.
 # Rewrite the restriction directly to METADATA file
 RUN sed -i '/Requires-Dist: triton.*/d' /opt/venv/lib/python3.10/site-packages/torch-*dist-info/METADATA
+
+
+# -----------------------
+# Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
+# _compute_local_source_files_hash calls Path(...).resolve() on custom-code
+# module files, following the HF-cache snapshots/<hash>/x.py -> blobs/<blob>
+# symlink. trust_remote_code models whose custom code uses relative imports
+# (e.g. Kimi-K2.6's kimi_k25_vision_processing.py: `from .media_utils import`)
+# then crash with FileNotFoundError: .../blobs/<name>.py at processor init.
+# Mirrors upstream transformers PR #46618 (merged, not yet released): drop the
+# .resolve() on the module file and its relative-import sources so the snapshot
+# .py names (not the blob targets) are used. Self-skips once transformers ships
+# the fix; fails the build loudly if the pattern is present but unpatched.
+RUN python3 - <<'PY'
+import pathlib
+import transformers.dynamic_module_utils as m
+
+MARKS = ["Path(resolved_module_file).resolve()", "Path(source_file).resolve()"]
+path = pathlib.Path(m.__file__)
+src = path.read_text()
+if not any(mark in src for mark in MARKS):
+    print("transformers dynamic_module_utils already fixed; no patch needed")
+else:
+    patched = (
+        src.replace("Path(resolved_module_file).resolve()", "Path(resolved_module_file)")
+           .replace("Path(source_file).resolve()", "Path(source_file)")
+    )
+    assert patched != src, "FATAL: transformers symlink patch matched nothing"
+    path.write_text(patched)
+    print("patched transformers dynamic_module_utils.py (symlink hash fix)")
+PY
 
 # -----------------------
 # Install the Triton AITER pins, replacing the base image's. No version check
