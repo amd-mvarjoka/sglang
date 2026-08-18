@@ -91,6 +91,12 @@ ARG BRANCH_TYPE=remote
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
+<<<<<<< HEAD
+=======
+ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
+ARG TRITON_COMMIT="v3.6.0"
+
+>>>>>>> 1ccb7c3626c34e50871eb5141c50670a4ddc095e
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
@@ -336,7 +342,7 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
 
 # Build and install sgl-model-gateway
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev && rm -rf /var/lib/apt/lists/* \
-    && python3 -m pip install --no-cache-dir maturin \
+    && python3 -m pip install --no-cache-dir "maturin<1.14" \
     && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
            /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
     && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
@@ -525,6 +531,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[MORI] Done."'
 
 # -----------------------
+<<<<<<< HEAD
 # NIXL — upstream ai-dynamo/nixl KV transfer backend for PD disaggregation on ROCm.
 # Builds UCX (--with-rocm) + nixl from source by default; skip with ENABLE_NIXL=0.
 # --no-build-isolation reuses the image's ROCm torch (nixl pins torch==2.11.* as a build dep,
@@ -557,6 +564,12 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])"); \
   ln -sfn nixl_rocm "$SITE/nixl"; \
   echo "export LD_LIBRARY_PATH=/opt/ucx/lib:\${LD_LIBRARY_PATH}" >> /etc/bash.bashrc'
+=======
+# Hot patch: torch-ROCm
+# The supported Triton version has been hardcoded in Pytorch as version 3.5.1.
+# Rewrite the restriction directly to METADATA file
+RUN sed -i '/Requires-Dist: triton.*/d' /opt/venv/lib/python3.10/site-packages/torch-*dist-info/METADATA
+>>>>>>> 1ccb7c3626c34e50871eb5141c50670a4ddc095e
 
 # -----------------------
 # Hot patch: torch-ROCm
