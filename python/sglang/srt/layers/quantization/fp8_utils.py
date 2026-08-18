@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -96,9 +97,14 @@ class _MXFP4QuantizedData(MXFP4QuantizeUtil):
 
 # Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
 # projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
-# Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
-# SGLANG_FORCE_CK_W8A8=1 still works as an override.
+# Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True).
 _FORCE_CK_W8A8: bool = False
+
+# Opposite override, for testing the Triton path on shapes that would otherwise
+# take CK. Read once at import: the tuned-shape lookup below runs per GEMM, and
+# also at weight-load time to decide whether to CK-preshuffle the weight, so the
+# answer must not change mid-run.
+_FORCE_TRITON_W8A8: bool = envs.SGLANG_FORCE_TRITON_W8A8.get()
 
 
 def set_force_ck_w8a8(enabled: bool = True) -> None:
@@ -139,6 +145,8 @@ def view_aiter_fused_rms_transposed_fp8_scale_tuple(
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
+    if _FORCE_TRITON_W8A8:
+        return True
     if _FORCE_CK_W8A8:
         return False
     return (n, k) in [
@@ -1131,22 +1139,20 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-        if _use_aiter_bpreshuffle_gfx95 and not use_triton:
-            # The CK bpreshuffle GEMM wants the per-token scale in M-major
-            # physical order. Callers on this path hand us the scale either
+        if _use_aiter_bpreshuffle_gfx95:
+            # On ROCm >= 7.2 the scale arrives in bpreshuffle's transposed
+            # layout, and both GEMMs selected below -- CK bpreshuffle and
+            # Triton -- want the same logical [M, G] tensor over those M-major
+            # bytes. Callers hand us the scale either
             # (a) as raw transpose_scale=True bytes -- physically M-major
             #     already, exposed as a row-major-looking [M, G] view (strides
-            #     (G, 1)), or (b) pre-materialized to strides (1, M).
+            #     (G, 1)), or (b) pre-restrided to (1, M) at the producer.
             # as_strided to (1, M) yields the correct logical [M, G] over the
             # same bytes in both cases -- a no-op on (b), the corrective view
             # on (a) -- with zero copy. A natural (un-transposed) row-major
             # scale must never reach this branch; every bpreshuffle producer
             # emits (a) or (b).
             x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
-        # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
-        # Triton needs a row-major view, so adjust strides only. No copy.
-        elif use_triton and _use_aiter_bpreshuffle_gfx95:
-            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
         materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
         # Ask the quant kernel to emit the M-major bytes the bpreshuffle GEMM

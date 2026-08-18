@@ -1353,6 +1353,11 @@ class Envs:
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    # Route every gfx95 w8a8-block FP8 GEMM through the AITER Triton kernel
+    # instead of only the shapes in the tuned list. Testing/bring-up knob: it
+    # exercises the Triton path on shapes that would normally take CK, at a
+    # likely perf cost. Takes precedence over set_force_ck_w8a8().
+    SGLANG_FORCE_TRITON_W8A8 = EnvBool(False)
 
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
