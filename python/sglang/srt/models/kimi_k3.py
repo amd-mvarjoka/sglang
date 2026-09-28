@@ -139,6 +139,11 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
+# Above M*topk rows aiter's fused_dynamic_mx_quant_moe_sort leaves the
+# stride-aware fused kernel for the split path (per_1x32_mx_quant_hip +
+# mxfp4_moe_sort_hip), which is not audited for a strided input.
+_AITER_FUSED_QUANT_MAX_ROWS = 8 * 256
+
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -723,6 +728,8 @@ class KimiK3MoE(nn.Module):
             "_front_fp32",
             "_routing_contract_ok",
             "_ep_front_eligible",
+            # depends on _front_sizes, only known once the merge runs
+            "_aiter_front_slice_max_rows",
         ):
             self.__dict__.pop(prop, None)
 
@@ -1253,6 +1260,32 @@ class KimiK3MoE(nn.Module):
         )
 
     @cached_property
+    def _aiter_front_slice_max_rows(self) -> int:
+        """How many rows (num_tokens * top_k) ROCm aiter takes as the front
+        GEMM hands them over, strided and fp32; 0 when it never does.
+
+        aiter reads the slice as it comes -- moe_runner/aiter.py ->
+        aiter.fused_moe -> fused_dynamic_mxfp4_quant_moe_sort addresses rows
+        through input.stride(-2), with only a same-shape view(-1, N) in between
+        -- but only in its fused quant branch, which decode fits under and
+        prefill does not."""
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        method = self.experts.quant_method
+        if (
+            _is_hip
+            and isinstance(method, Mxfp4MoEMethod)
+            and method.runner.runner_backend.is_aiter()
+            and method.hidden_size == self.moe_hidden_size
+            and self._front_sizes is not None
+            # aiter's fused_mx_quant_moe_sort_kernel vector-loads 16B from each
+            # row start, so the front row pitch must be 8 bf16 elems aligned
+            and sum(self._front_sizes) % 8 == 0
+        ):
+            return _AITER_FUSED_QUANT_MAX_ROWS
+        return 0
+
+    @cached_property
     def _route_quant_fuse_eligible(self) -> bool:
         """Whether to stage routed_input for the fused route+pack+quant launch
         (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
@@ -1342,7 +1375,11 @@ class KimiK3MoE(nn.Module):
         )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
+        # the max_rows is 0 off ROCm, so this only ever widens the HIP path
+        aiter_takes_slice = (
+            num_tokens * self.experts.top_k <= self._aiter_front_slice_max_rows
+        )
+        if self._moe_front_needs_dense_bf16 and not aiter_takes_slice:
             # off an fp32 front the cast allocates the dense buffer, so the
             # contiguous() behind it is free; off a bf16 front it is the copy
             routed_input = routed_input.to(hidden_states.dtype).contiguous()
