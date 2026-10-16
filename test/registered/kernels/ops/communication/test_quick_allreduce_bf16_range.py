@@ -26,6 +26,10 @@ def _get_open_port() -> int:
 
 def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
     os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = "1"
+    # This covers the HIP kernels' bf16->fp16 cast. With SGLANG_USE_AITER set
+    # (as in AMD CI), BF16 INT4 would otherwise run AITER's FlyDSL kernel,
+    # whose codec is not exact on the constant inputs checked below.
+    os.environ["SGLANG_ROCM_FLYDSL_QUICK_REDUCE"] = "0"
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)

@@ -952,6 +952,10 @@ class Envs:
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    # With ROCM_QUICK_REDUCE_QUANTIZATION=INT4 and SGLANG_USE_AITER on
+    # gfx942/gfx950, BF16 quick-reduce payloads run AITER's FlyDSL INT4
+    # all-reduce instead of the HIP INT4 kernels. Set to 0 to keep HIP.
+    SGLANG_ROCM_FLYDSL_QUICK_REDUCE = EnvBool(True)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
     SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
     SGLANG_AMD_FLYDSL_MEGA_QUANT = EnvStr("")

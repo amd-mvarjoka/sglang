@@ -4,7 +4,7 @@ import logging
 import os
 from enum import Enum
 from functools import cache
-from typing import Union
+from typing import Any, Union
 
 import torch
 import torch.distributed as dist
@@ -16,6 +16,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,24 @@ def qr_rocm_arch_available():
         return False
 
 
+@cache
+def flydsl_int4_arch_available():
+    """Whether AITER's FlyDSL INT4 QuickReduce supports this GPU.
+
+    Narrower than ``qr_rocm_arch_available``: AITER's QuickAllReduceInt4 runs
+    on gfx942 and gfx950 only.
+    """
+    if not _is_hip:
+        return False
+    try:
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "").split(":")[0]
+        return gcn_arch in ("gfx942", "gfx950")
+    except Exception as e:
+        logger.warning("Failed to determine ROCm arch for FlyDSL quick reduce: %s", e)
+        return False
+
+
 class QuickReduceRegime(Enum):
     FP = 0
     INT8 = 1
@@ -50,6 +69,9 @@ MB = 1024 * 1024
 
 
 class QuickAllReduce:
+    # AITER FlyDSL INT4 communicator; None unless the INT4 codec is selected
+    # and AITER can run it.
+    _flydsl_int4: Any = None
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     # The following data is based on kernel tests.
@@ -208,6 +230,49 @@ class QuickAllReduce:
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
+        # After enabling: if this raises, the caller drops the communicator
+        # and close() in __del__ releases the HIP buffers too.
+        self._init_flydsl_int4()
+
+    def _init_flydsl_int4(self):
+        """Route INT4 BF16 payloads to AITER's FlyDSL INT4 QuickReduce.
+
+        It is a faster drop-in for the HIP INT4 kernels. SGLANG_USE_AITER
+        turns it off with the rest of AITER; SGLANG_ROCM_FLYDSL_QUICK_REDUCE
+        turns off just this kernel.
+        """
+        if (
+            self.qr_quant_level != QuickReduceRegime.INT4
+            or not envs.SGLANG_USE_AITER.get()
+            or not envs.SGLANG_ROCM_FLYDSL_QUICK_REDUCE.get()
+            or not flydsl_int4_arch_available()
+        ):
+            return
+        try:
+            from aiter.ops.flydsl import QuickAllReduceInt4
+        except ImportError as e:
+            logger.warning(
+                "AITER FlyDSL INT4 QuickReduce is unavailable (%s); using the "
+                "HIP QuickReduce kernels.",
+                e,
+            )
+            return
+        self._flydsl_int4 = QuickAllReduceInt4(
+            group=self.group,
+            device=self.device,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
+        # compile() runs a real all-reduce on every rank. It moves the JIT
+        # out of the first prefill and out of CUDA graph capture; sizes are
+        # runtime arguments, so one payload covers every later call.
+        warmup = torch.zeros(MB, dtype=torch.bfloat16, device=self.device)
+        self._flydsl_int4.compile(warmup, torch.empty_like(warmup))
+        torch.cuda.synchronize(self.device)
+        logger.info(
+            "Using AITER FlyDSL INT4 QuickReduce for BF16 payloads; other "
+            "payloads use the HIP QuickReduce kernels."
+        )
 
     def create_shared_buffer(self):
         """
@@ -250,12 +315,32 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+        if self._use_flydsl_int4(inp, out):
+            self._flydsl_int4.allreduce(inp, out)
+            return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
         return out
 
+    def _use_flydsl_int4(self, inp: torch.Tensor, out: torch.Tensor) -> bool:
+        # FlyDSL takes BF16 only (FP16 stays on HIP) and, unlike the HIP
+        # kernels, needs dense 16-byte-aligned buffers: is_weak_contiguous
+        # in should_quick_allreduce admits tensors it would reject.
+        return (
+            self._flydsl_int4 is not None
+            and inp.dtype == torch.bfloat16
+            and out.dtype == torch.bfloat16
+            and inp.is_contiguous()
+            and out.is_contiguous()
+            and inp.data_ptr() % 16 == 0
+            and out.data_ptr() % 16 == 0
+        )
+
     def close(self):
+        if self._flydsl_int4 is not None:
+            self._flydsl_int4.close()
+            self._flydsl_int4 = None
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
