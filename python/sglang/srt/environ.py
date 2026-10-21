@@ -953,9 +953,16 @@ class Envs:
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # With ROCM_QUICK_REDUCE_QUANTIZATION=INT4 and SGLANG_USE_AITER on
-    # gfx942/gfx950, BF16 quick-reduce payloads run AITER's FlyDSL INT4
-    # all-reduce instead of the HIP INT4 kernels. Set to 0 to keep HIP.
+    # gfx942/gfx950, contiguous BF16 payloads of at least
+    # SGLANG_ROCM_FLYDSL_QUICK_REDUCE_MIN_SIZE_KB run AITER's FlyDSL INT4
+    # all-reduce, ahead of the custom all-reduce and the HIP INT4 kernels.
+    # Set to 0 to keep the HIP-only behaviour.
     SGLANG_ROCM_FLYDSL_QUICK_REDUCE = EnvBool(True)
+    # Smallest payload (KiB) sent to FlyDSL INT4. 0 uses the per-TP-size
+    # default (1 MiB at TP2, 2 MiB at TP4/TP8): below it the custom
+    # all-reduce is faster. INT4 is lossy, so raising it also keeps more
+    # all-reduces exact, e.g. decode batches.
+    SGLANG_ROCM_FLYDSL_QUICK_REDUCE_MIN_SIZE_KB = EnvInt(0)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
     SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
     SGLANG_AMD_FLYDSL_MEGA_QUANT = EnvStr("")

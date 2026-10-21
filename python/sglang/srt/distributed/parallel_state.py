@@ -779,6 +779,7 @@ class GroupCoordinator:
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
             and not should_use_custom_allreduce
+            and not self._flydsl_int4_takes(input_)
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
@@ -826,6 +827,9 @@ class GroupCoordinator:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+
+        if self._flydsl_int4_takes(input_):
             return None
 
         # Prefer communicator-native fused API when provided.
@@ -913,6 +917,9 @@ class GroupCoordinator:
         if not hasattr(ca_comm, "custom_fused_ar_rms_per_group_quant"):
             return None
 
+        if self._flydsl_int4_takes(input_):
+            return None
+
         # Shape / size eligibility mirrors aiter's internal gate so we fail
         # fast without entering the HIP kernel dispatch.
         K = input_.shape[-1]
@@ -954,6 +961,17 @@ class GroupCoordinator:
         except Exception:
             return None
 
+    def _flydsl_int4_takes(self, input_: torch.Tensor) -> bool:
+        """Whether AITER's FlyDSL INT4 quick-reduce will all-reduce ``input_``.
+
+        It has no fused RMSNorm kernel, so the fused entry points step aside
+        for these payloads: the caller then runs this all-reduce followed by a
+        separate RMSNorm, as it does for any other payload the fused kernels
+        decline.
+        """
+        qr_comm = self.qr_comm
+        return qr_comm is not None and qr_comm.uses_flydsl_int4(input_)
+
     def _resolve_outplace_all_reduce_method(
         self,
         input_: torch.Tensor,
@@ -964,6 +982,11 @@ class GroupCoordinator:
                 self.pymscclpp_comm is not None
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
+        if self._flydsl_int4_takes(input_):
+            # FlyDSL INT4 beats the custom all-reduce from its size floor up,
+            # but not below it, so it is asked first and only for its window.
+            # The rest of quick-reduce keeps its place behind ca/pcie_ipc.
+            return "qr"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled

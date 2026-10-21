@@ -131,6 +131,14 @@ def _run_flydsl_int4_test(rank: int, world_size: int, port: int) -> None:
         try:
             for seed, shape in enumerate(SHAPES):
                 inp = _rank_input(shape, rank, seed).to(device)
+                # The dispatcher's window: under the floor the custom
+                # all-reduce keeps the payload; quick_all_reduce itself still
+                # runs FlyDSL when called directly, which is what is checked.
+                nbytes = inp.numel() * inp.element_size()
+                assert qr.uses_flydsl_int4(inp) == (nbytes >= qr._flydsl_min_size), (
+                    f"window wrong for {shape}: {nbytes} B, floor "
+                    f"{qr._flydsl_min_size} B"
+                )
                 dist.barrier()
                 out = qr.quick_all_reduce(inp)
                 torch.cuda.synchronize()
@@ -170,7 +178,8 @@ def _run_flydsl_int4_test(rank: int, world_size: int, port: int) -> None:
             # FP16 payloads stay on the HIP INT4 kernels. Its codec differs,
             # so the bound only catches a broken route, not codec quality.
             fp16 = _rank_input(shape, rank, 200).to(device, torch.float16)
-            assert not qr._use_flydsl_int4(fp16, torch.empty_like(fp16))
+            assert not qr._flydsl_accepts(fp16, torch.empty_like(fp16))
+            assert not qr.uses_flydsl_int4(fp16)
             dist.barrier()
             out = qr.quick_all_reduce(fp16)
             torch.cuda.synchronize()

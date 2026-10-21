@@ -48,7 +48,7 @@ class _FakeFlyDSLInt4:
         self.closed = True
 
 
-def _make_quick_reduce(quant_level=QuickReduceRegime.INT4):
+def _make_quick_reduce(quant_level=QuickReduceRegime.INT4, world_size=8):
     """Build an enabled communicator without a process group or GPU.
 
     The constructor needs both; the routing under test needs neither.
@@ -58,9 +58,10 @@ def _make_quick_reduce(quant_level=QuickReduceRegime.INT4):
     quick_reduce.group = object()
     quick_reduce.device = torch.device("cpu")
     quick_reduce.rank = 0
-    quick_reduce.world_size = 8
+    quick_reduce.world_size = world_size
     quick_reduce.qr_quant_level = quant_level
     quick_reduce.use_fp16_kernels = 1
+    quick_reduce.qr_max_size = 2048 * MB
     quick_reduce._ptr = 0
     return quick_reduce
 
@@ -120,6 +121,83 @@ class TestFlyDSLInt4Dispatch(CustomTestCase):
         self.assertEqual(len(hip_calls), 1)
 
 
+class TestFlyDSLInt4Window(CustomTestCase):
+    """``uses_flydsl_int4`` is the dispatcher's question, so it owns the size
+    window: the custom all-reduce wins below the floor, FlyDSL above it."""
+
+    def _quick_reduce(self, world_size=8, min_size=2 * MB):
+        quick_reduce = _make_quick_reduce(world_size=world_size)
+        quick_reduce._flydsl_int4 = _FakeFlyDSLInt4()
+        quick_reduce._flydsl_min_size = min_size
+        return quick_reduce
+
+    def test_window_starts_at_the_floor(self):
+        quick_reduce = self._quick_reduce(min_size=2 * MB)
+        below = _bf16(MB - 8)  # 2 MiB less 16 B
+        at = _bf16(MB)
+        self.assertFalse(quick_reduce.uses_flydsl_int4(below))
+        self.assertTrue(quick_reduce.uses_flydsl_int4(at))
+        self.assertTrue(quick_reduce.uses_flydsl_int4(_bf16(64 * MB)))
+
+    def test_window_is_wider_than_the_hip_window_with_bf16_table(self):
+        # should_quick_allreduce reads the BF16 table when the fp16 cast is
+        # off, where TP8 INT4 needs 2048 MB: HIP would take nothing. FlyDSL
+        # ignores the cast, so its window must not follow that table.
+        quick_reduce = self._quick_reduce()
+        quick_reduce.use_fp16_kernels = 0
+        inp = _bf16(4 * MB)  # 8 MiB
+        self.assertFalse(quick_reduce.should_quick_allreduce(inp))
+        self.assertTrue(quick_reduce.uses_flydsl_int4(inp))
+
+    def test_max_size_caps_the_window(self):
+        quick_reduce = self._quick_reduce()
+        quick_reduce.qr_max_size = 16 * MB
+        self.assertTrue(quick_reduce.uses_flydsl_int4(_bf16(8 * MB)))  # 16 MiB
+        self.assertFalse(quick_reduce.uses_flydsl_int4(_bf16(8 * MB + 8)))
+
+    def test_four_gib_window_of_the_kernel_caps_the_window(self):
+        quick_reduce = self._quick_reduce()
+        quick_reduce.qr_max_size = 8 * 1024 * MB
+        quick_reduce._FLYDSL_MAX_SIZE = 8 * MB  # stand-in for 4 GiB
+        self.assertTrue(quick_reduce.uses_flydsl_int4(_bf16(4 * MB)))
+        self.assertFalse(quick_reduce.uses_flydsl_int4(_bf16(4 * MB + 8)))
+
+    def test_payloads_flydsl_cannot_take_are_not_claimed(self):
+        quick_reduce = self._quick_reduce()
+        for name, inp in (
+            ("fp16", torch.empty(MB, dtype=torch.float16)),
+            ("non_contiguous", _bf16(2 * MB).view(1024, 2048).t()),
+            ("misaligned", _bf16(MB + 16)[4 : MB + 4]),
+            ("not_16_bytes", _bf16(MB + 3)),
+        ):
+            with self.subTest(name):
+                self.assertFalse(quick_reduce.uses_flydsl_int4(inp))
+
+    def test_disabled_or_missing_communicator_claims_nothing(self):
+        quick_reduce = self._quick_reduce()
+        quick_reduce.disabled = True
+        self.assertFalse(quick_reduce.uses_flydsl_int4(_bf16(MB)))
+        quick_reduce = _make_quick_reduce()  # no FlyDSL communicator
+        self.assertFalse(quick_reduce.uses_flydsl_int4(_bf16(MB)))
+
+    def test_claimed_payload_runs_on_flydsl(self):
+        # The dispatcher resolves to "qr" on uses_flydsl_int4; quick_all_reduce
+        # must then really take the FlyDSL branch, not HIP.
+        quick_reduce = self._quick_reduce()
+        inp = _bf16(MB)
+        self.assertTrue(quick_reduce.uses_flydsl_int4(inp))
+        hip_calls = []
+        with patch.object(
+            qr_mod.ops,
+            "qr_all_reduce",
+            lambda *args: hip_calls.append(args),
+            create=True,
+        ):
+            quick_reduce.quick_all_reduce(inp)
+        self.assertEqual(quick_reduce._flydsl_int4.allreduce_calls, 1)
+        self.assertEqual(hip_calls, [])
+
+
 class TestFlyDSLInt4Init(CustomTestCase):
     def setUp(self):
         _FakeFlyDSLInt4.instances.clear()
@@ -137,11 +215,21 @@ class TestFlyDSLInt4Init(CustomTestCase):
         self._arch.stop()
         self._modules.stop()
 
-    def _init(self, quant_level=QuickReduceRegime.INT4, use_aiter=True, flydsl=True):
-        quick_reduce = _make_quick_reduce(quant_level)
+    def _init(
+        self,
+        quant_level=QuickReduceRegime.INT4,
+        use_aiter=True,
+        flydsl=True,
+        world_size=8,
+        min_size_kb=0,
+        use_fp16_kernels=1,
+    ):
+        quick_reduce = _make_quick_reduce(quant_level, world_size=world_size)
+        quick_reduce.use_fp16_kernels = use_fp16_kernels
         with (
             envs.SGLANG_USE_AITER.override(use_aiter),
             envs.SGLANG_ROCM_FLYDSL_QUICK_REDUCE.override(flydsl),
+            envs.SGLANG_ROCM_FLYDSL_QUICK_REDUCE_MIN_SIZE_KB.override(min_size_kb),
         ):
             quick_reduce._init_flydsl_int4()
         return quick_reduce
@@ -154,6 +242,23 @@ class TestFlyDSLInt4Init(CustomTestCase):
         self.assertEqual(fake.init_kwargs["world_size"], 8)
         self.assertIs(fake.init_kwargs["group"], quick_reduce.group)
         self.assertEqual(fake.compiled, [(torch.bfloat16, MB)])
+
+    def test_min_size_defaults_per_world_size(self):
+        # The FP16 INT4 row of _QR_MIN_SIZE: 1 MiB at TP2, 2 MiB at TP4/TP8.
+        for world_size, expected in ((2, MB), (4, 2 * MB), (8, 2 * MB)):
+            with self.subTest(world_size=world_size):
+                quick_reduce = self._init(world_size=world_size)
+                self.assertEqual(quick_reduce._flydsl_min_size, expected)
+
+    def test_min_size_ignores_the_bf16_cast_setting(self):
+        # With the cast off the BF16 table asks 2048 MB at TP8; FlyDSL does
+        # not cast, so its floor must stay the FP16 row.
+        quick_reduce = self._init(use_fp16_kernels=0)
+        self.assertEqual(quick_reduce._flydsl_min_size, 2 * MB)
+
+    def test_min_size_env_overrides_the_default(self):
+        quick_reduce = self._init(min_size_kb=8192)
+        self.assertEqual(quick_reduce._flydsl_min_size, 8 * MB)
 
     def test_other_codecs_do_not_build(self):
         for level in (QuickReduceRegime.FP, QuickReduceRegime.INT6):

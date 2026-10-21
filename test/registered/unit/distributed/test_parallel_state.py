@@ -172,6 +172,132 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
+def _flydsl_coordinator(flydsl_takes: bool, ca_takes: bool = True):
+    """A coordinator with a custom all-reduce and a quick-reduce whose FlyDSL
+    INT4 window either does or does not cover the payload."""
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 8
+    coordinator.unique_name = "test"
+    coordinator.pymscclpp_comm = None
+    coordinator.pcie_ipc_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator.pynccl_comm = None
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = ca_takes
+    coordinator.qr_comm = Mock(disabled=False)
+    coordinator.qr_comm.uses_flydsl_int4.return_value = flydsl_takes
+    # The HIP window is not what is under test: leave it open so that a
+    # wrong ordering would still land on "qr" or "ca" and not on None.
+    coordinator.qr_comm.should_quick_allreduce.return_value = True
+    return coordinator
+
+
+def test_flydsl_int4_precedes_custom_allreduce():
+    # Both accept the payload; only FlyDSL's own window puts it first.
+    coordinator = _flydsl_coordinator(flydsl_takes=True, ca_takes=True)
+    input_ = Mock(is_cpu=False)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "qr"
+    coordinator.qr_comm.uses_flydsl_int4.assert_called_with(input_)
+
+
+def test_custom_allreduce_keeps_payloads_outside_the_flydsl_window():
+    coordinator = _flydsl_coordinator(flydsl_takes=False, ca_takes=True)
+    assert coordinator._resolve_outplace_all_reduce_method(Mock()) == "ca"
+
+
+def test_hip_quick_reduce_keeps_its_place_behind_custom_allreduce():
+    # Quick-reduce that FlyDSL does not claim (e.g. fp16 INT4) is unchanged:
+    # still behind ca, ahead of mscclpp/NCCL.
+    coordinator = _flydsl_coordinator(flydsl_takes=False, ca_takes=False)
+    assert coordinator._resolve_outplace_all_reduce_method(Mock()) == "qr"
+    coordinator = _flydsl_coordinator(flydsl_takes=False, ca_takes=True)
+    assert coordinator._resolve_outplace_all_reduce_method(Mock()) == "ca"
+
+
+def test_no_quick_reduce_communicator_does_not_claim_flydsl():
+    coordinator = _flydsl_coordinator(flydsl_takes=True, ca_takes=True)
+    coordinator.qr_comm = None
+    assert coordinator._resolve_outplace_all_reduce_method(Mock()) == "ca"
+
+
+def test_flydsl_int4_precedes_symmetric_memory_pynccl():
+    # The symmetric-memory branch runs before the dispatcher. A payload that
+    # FlyDSL takes must get past it, or it would lose the fused kernel (which
+    # steps aside for FlyDSL) and not reach FlyDSL either.
+    coordinator = _flydsl_coordinator(flydsl_takes=True, ca_takes=False)
+    coordinator.hpu_communicator = None
+    coordinator.xpu_communicator = None
+    coordinator.npu_communicator = None
+    coordinator._fi_workspace_hint = None
+    coordinator.pynccl_comm = Mock()
+    coordinator.pynccl_comm.change_state.return_value = nullcontext()
+    coordinator.is_symmetric_memory_enabled = Mock(return_value=True)
+    coordinator.debug_check_symmetric_mempool = Mock()
+    input_ = Mock(is_cpu=False)
+    flydsl_output = object()
+
+    with (
+        patch.object(parallel_state.torch.compiler, "is_compiling", return_value=False),
+        patch.object(
+            parallel_state, "outplace_all_reduce", return_value=flydsl_output
+        ) as outplace_all_reduce,
+    ):
+        output = coordinator.all_reduce(input_)
+
+    assert output is flydsl_output
+    outplace_all_reduce.assert_called_once_with(
+        input_, group_name="test", outplace_all_reduce_method="qr"
+    )
+    coordinator.pynccl_comm.all_reduce.assert_not_called()
+
+
+def test_fused_allreduce_rmsnorm_steps_aside_for_flydsl_payloads():
+    # FlyDSL INT4 has no fused RMSNorm. Returning None makes the caller run
+    # the all-reduce (which reaches FlyDSL) and a separate RMSNorm.
+    coordinator = _flydsl_coordinator(flydsl_takes=True)
+    args = (Mock(), Mock(), Mock(), 1e-6)
+
+    assert coordinator.fused_allreduce_rmsnorm(*args) is None
+
+    coordinator.ca_comm.fused_allreduce_rmsnorm.assert_not_called()
+    coordinator.ca_comm.custom_fused_ar_rms.assert_not_called()
+
+
+def test_fused_allreduce_rmsnorm_still_fuses_outside_the_flydsl_window():
+    coordinator = _flydsl_coordinator(flydsl_takes=False)
+    args = (Mock(), Mock(), Mock(), 1e-6)
+
+    result = coordinator.fused_allreduce_rmsnorm(*args)
+
+    assert result is coordinator.ca_comm.fused_allreduce_rmsnorm.return_value
+    coordinator.ca_comm.fused_allreduce_rmsnorm.assert_called_once()
+
+
+@pytest.mark.parametrize("flydsl_takes", [True, False])
+def test_fused_allreduce_rmsnorm_quant_per_group_steps_aside_for_flydsl(
+    flydsl_takes,
+):
+    coordinator = _flydsl_coordinator(flydsl_takes=flydsl_takes)
+    input_ = torch.empty(16, 7168, dtype=torch.bfloat16)  # inside aiter's gate
+    args = (input_, Mock(), Mock(), 1e-6)
+
+    with (
+        patch.object(parallel_state, "is_hip", return_value=True),
+        patch.object(parallel_state, "is_gfx95_supported", return_value=True),
+    ):
+        result = coordinator.fused_allreduce_rmsnorm_quant_per_group(*args)
+
+    kernel = coordinator.ca_comm.custom_fused_ar_rms_per_group_quant
+    if flydsl_takes:
+        assert result is None
+        kernel.assert_not_called()
+    else:
+        assert result is kernel.return_value
+        kernel.assert_called_once()
+
+
 @pytest.mark.parametrize("custom_allreduce_enabled", [False, True])
 def test_parallel_group_construction_tp8_attn_cp2(custom_allreduce_enabled):
     """
