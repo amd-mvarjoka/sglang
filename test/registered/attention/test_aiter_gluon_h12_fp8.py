@@ -18,6 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _GLUON_FN = "sglang.srt.layers.attention.aiter_mla_gluon._gluon_fn"
+_GFX95 = "sglang.srt.layers.attention.aiter_mla_gluon.is_gfx95_supported"
 
 
 def _fake_gluon_modules(*, cga_layout: bool):
@@ -87,17 +88,35 @@ class TestGluonAvailability(CustomTestCase):
 
     def test_none_when_triton_lacks_cga_layout(self):
         _fn, modules = _fake_gluon_modules(cga_layout=False)
-        with mock.patch.dict("sys.modules", modules):
+        with (
+            mock.patch.dict("sys.modules", modules),
+            mock.patch(_GFX95, return_value=True),
+        ):
+            self.assertIsNone(mod._gluon_fn())
+
+    def test_none_before_gfx950(self):
+        # mla_gluon asserts gfx950; gfx942 must take the zero-pad fallback.
+        _fn, modules = _fake_gluon_modules(cga_layout=True)
+        with (
+            mock.patch.dict("sys.modules", modules),
+            mock.patch(_GFX95, return_value=False),
+        ):
             self.assertIsNone(mod._gluon_fn())
 
     def test_returns_kernel_when_ready(self):
         fake_fn, modules = _fake_gluon_modules(cga_layout=True)
-        with mock.patch.dict("sys.modules", modules):
+        with (
+            mock.patch.dict("sys.modules", modules),
+            mock.patch(_GFX95, return_value=True),
+        ):
             self.assertIs(mod._gluon_fn(), fake_fn)
 
     def test_result_is_cached(self):
         fake_fn, modules = _fake_gluon_modules(cga_layout=True)
-        with mock.patch.dict("sys.modules", modules):
+        with (
+            mock.patch.dict("sys.modules", modules),
+            mock.patch(_GFX95, return_value=True),
+        ):
             first = mod._gluon_fn()
         # Second call must not re-probe: the fake modules are gone by now, so a
         # re-probe would return None instead of the cached kernel.
@@ -365,6 +384,113 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         )
         self.assertEqual(mock_gluon.call_args.kwargs["qlen"], 8)
         be._mla_decode_fwd_with_head_pad.assert_not_called()
+
+
+class TestMlaNativeLowHeadVerify(CustomTestCase):
+    """Target verify on aiter's native low-head kernel: real heads, own schedule."""
+
+    _BACKEND = "sglang.srt.layers.attention.aiter_backend"
+
+    def _make_backend(self, *, verify_backend="asm", num_draft_tokens=8):
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        be = AiterAttnBackend.__new__(AiterAttnBackend)
+        be.num_head = 12
+        be.input_dtype = torch.bfloat16
+        be.kv_cache_dtype = fp8_dtype
+        be.mla_kernel_num_head_padded = 16
+        be.mla_verify_backend = verify_backend
+        be.num_draft_tokens = num_draft_tokens
+        be.dcp_world_size = 1
+        be.page_size = 1
+        return be
+
+    @mock.patch(f"{_BACKEND}.mla_decode_fwd")
+    def test_verify_runs_real_heads_without_padding(self, mock_decode):
+        be = self._make_backend()
+        be.forward_metadata = mock.Mock(max_q_len=8, num_kv_splits=32)
+        q = torch.zeros(32, 12 * 576, dtype=torch.bfloat16)
+        k = torch.zeros(64, 576, dtype=fp8_dtype)
+        k_descale = torch.ones(1)
+
+        out = be._forward_mla_native_verify(q, k, _layer(), k_descale)
+
+        self.assertEqual(out.shape, torch.Size([32, 12, 512]))
+        args, kwargs = mock_decode.call_args
+        self.assertEqual(args[0].shape, torch.Size([32, 12, 576]))
+        self.assertEqual(args[0].data_ptr(), q.data_ptr())
+        self.assertIs(args[2], out)
+        self.assertFalse(kwargs["intra_batch_mode"])
+        self.assertIs(kwargs["kv_scale"], k_descale)
+        self.assertNotIn("q_scale", kwargs)
+
+    @mock.patch(f"{_BACKEND}.is_gfx95_supported", return_value=False)
+    @mock.patch(f"{_BACKEND}._aiter_mla_native_low_head_verify", return_value=True)
+    def test_selection(self, mock_native, _gfx95):
+        # asm has no qlen 8 kernel on gfx942, so the default takes the native one.
+        self.assertTrue(self._make_backend()._select_mla_native_low_head_verify())
+        mock_native.assert_called_once_with(12, 8, torch.bfloat16, fp8_dtype)
+        # asm serves qlen 4 itself, gluon is an explicit choice, DCP has its own path.
+        for kwargs, dcp in (
+            ({"num_draft_tokens": 4}, 1),
+            ({"verify_backend": "gluon"}, 1),
+            ({}, 2),
+        ):
+            be = self._make_backend(**kwargs)
+            be.dcp_world_size = dcp
+            self.assertFalse(be._select_mla_native_low_head_verify())
+        be = self._make_backend(verify_backend="flydsl", num_draft_tokens=4)
+        self.assertTrue(be._select_mla_native_low_head_verify())
+
+    @mock.patch(f"{_BACKEND}._aiter_mla_native_low_head_verify", return_value=False)
+    def test_flydsl_without_kernel_falls_back_to_asm(self, _native):
+        be = self._make_backend(verify_backend="flydsl")
+        self.assertFalse(be._select_mla_native_low_head_verify())
+        self.assertEqual(be.mla_verify_backend, "asm")
+
+    def test_support_query(self):
+        import sys
+        import types
+
+        from sglang.srt.layers.attention.aiter_backend import (
+            _aiter_mla_native_low_head_verify as native,
+        )
+
+        def fake_aiter(**support):
+            module = types.ModuleType("aiter")
+            module.get_mla_decode_shape_support = mock.Mock(
+                return_value=mock.Mock(**support)
+            )
+            return module
+
+        args = (12, 8, torch.bfloat16, fp8_dtype)
+        cases = (
+            (types.ModuleType("aiter"), False),  # aiter without the API
+            (fake_aiter(supported=True, native=True, kernel_num_heads=12), True),
+            (fake_aiter(supported=True, native=False, kernel_num_heads=16), False),
+            (fake_aiter(supported=None, native=True, kernel_num_heads=12), False),
+        )
+        for module, expected in cases:
+            with mock.patch.dict(sys.modules, {"aiter": module}):
+                self.assertIs(native(*args), expected)
+        call = cases[1][0].get_mla_decode_shape_support.call_args
+        self.assertEqual(call.args, args)
+        self.assertEqual(call.kwargs, {"fast_mode": True, "intra_batch_mode": False})
+
+    @mock.patch(f"{_BACKEND}.get_mla_metadata_v1")
+    def test_metadata_plans_real_heads_with_bf16_query(self, mock_meta):
+        be = self._make_backend()
+        buffers = tuple(mock.Mock() for _ in range(6))
+        be.make_mla_native_verify_meta_data(
+            mock.Mock(), mock.Mock(), mock.Mock(), buffers, 8
+        )
+        args, kwargs = mock_meta.call_args
+        self.assertEqual(args[3], 12)
+        self.assertEqual(kwargs["dtype_q"], torch.bfloat16)
+        self.assertEqual(kwargs["dtype_kv"], fp8_dtype)
+        self.assertTrue(kwargs["fast_mode"])
+        self.assertFalse(kwargs["intra_batch_mode"])
+        self.assertEqual(kwargs["max_seqlen_qo"], 8)
 
 
 class TestMlaDcpAsmDecode(CustomTestCase):

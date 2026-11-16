@@ -1275,7 +1275,10 @@ class Envs:
     # and qk_rope_head_dim > 0, else startup raises). "auto" is "triton" there,
     # else "asm". Explicit values are honored as-is.
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStr("auto")
-    # Select the AITER MLA kernel for target verify, "asm" or "gluon".
+    # Select the AITER MLA kernel for target verify, "asm", "gluon", or
+    # "flydsl". "flydsl" asks for aiter's native low-head persistent kernel
+    # (4/8/12 heads per rank, no padding to 16); "asm" takes it on its own when
+    # the asm kernels have no kernel for the verify width (gfx942, qlen > 4).
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)

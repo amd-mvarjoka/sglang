@@ -237,6 +237,40 @@ def _asm_cprr_kernel_heads(gathered_heads: int, q_len: int) -> int:
     return 0
 
 
+# Split cap for the native low-head verify schedule: SGLang's persistent verify
+# setting, and the one aiter's low-head kernel is benchmarked at.
+_MLA_NATIVE_VERIFY_MAX_SPLIT = 32
+
+
+def _aiter_mla_native_low_head_verify(
+    num_head: int, q_len: int, q_dtype: torch.dtype, kv_dtype: torch.dtype
+) -> bool:
+    """Whether aiter runs this persistent verify shape at its real head count.
+
+    Asks aiter's get_mla_decode_shape_support for the schedule the native
+    verify path builds (fast_mode=True, intra_batch_mode=False). False when the
+    installed aiter has no such API or no kernel for the shape.
+    """
+    try:
+        from aiter import get_mla_decode_shape_support
+
+        support = get_mla_decode_shape_support(
+            num_head,
+            q_len,
+            q_dtype,
+            kv_dtype,
+            fast_mode=True,
+            intra_batch_mode=False,
+        )
+    except (ImportError, TypeError, ValueError, RuntimeError):
+        return False
+    return (
+        support.supported is True
+        and support.native
+        and support.kernel_num_heads == num_head
+    )
+
+
 # (v_head_dim -> query head counts) that aiter's mla_reduce_v1 has an
 # instantiation. This map is copied from MLA_REDUCE_ROUTER in
 # aiter/csrc/kernels/mla/reduce.cu. See https://github.com/ROCm/aiter/blob/7915f53a4225b3f9cb632a97a23369dbebcf1be0/csrc/kernels/mla/reduce.cu#L923
@@ -809,11 +843,12 @@ class AiterAttnBackend(AttentionBackend):
             and self.mla_decode_backend == "asm"
         )
         self.mla_verify_backend = envs.SGLANG_AITER_MLA_VERIFY_BACKEND.get().lower()
-        if self.mla_verify_backend not in ("gluon", "asm"):
+        if self.mla_verify_backend not in ("gluon", "asm", "flydsl"):
             raise ValueError(
-                "SGLANG_AITER_MLA_VERIFY_BACKEND must be 'gluon' or 'asm', "
-                f"got {self.mla_verify_backend!r}"
+                "SGLANG_AITER_MLA_VERIFY_BACKEND must be 'gluon', 'asm' or "
+                f"'flydsl', got {self.mla_verify_backend!r}"
             )
+        self.mla_native_low_head_verify = False
         self._cprr_launch_logged = False
         # fast_mode / intra_batch_mode for the cp verify schedule. Not the
         # module defaults: those size reduce_partial_map at 65536 entries
@@ -1181,6 +1216,7 @@ class AiterAttnBackend(AttentionBackend):
             self.mla_kernel_num_head_padded = (
                 16 if _gathered_num_head < 16 else _gathered_num_head
             )
+            self.mla_native_low_head_verify = self._select_mla_native_low_head_verify()
 
             self.attn_dp_enabled = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
@@ -1511,6 +1547,7 @@ class AiterAttnBackend(AttentionBackend):
         intra_batch_mode,
         is_cp_round_robin=False,
         nhead_override=None,
+        dtype_q=None,
     ):
         nhead_kv = 1
         page_size = self.page_size
@@ -1541,8 +1578,59 @@ class AiterAttnBackend(AttentionBackend):
             max_split_per_batch=max_split_per_batch,
             intra_batch_mode=intra_batch_mode,
             is_cp_round_robin=is_cp_round_robin,
-            dtype_q=dtype,
+            dtype_q=dtype if dtype_q is None else dtype_q,
             dtype_kv=dtype,
+        )
+
+    def make_mla_native_verify_meta_data_buffer(self, max_seqlen_qo, batch_size):
+        """Allocate the work-schedule buffers for the native low-head verify.
+
+        The schedule is planned at the real head count with a BF16 query, as
+        make_mla_native_verify_meta_data plans it.
+        """
+        info = get_mla_metadata_info_v1(
+            batch_size,
+            max_seqlen_qo,
+            self.num_head,
+            self.input_dtype,
+            self.kv_cache_dtype,
+            is_sparse=False,
+            fast_mode=True,
+            num_kv_splits=_MLA_NATIVE_VERIFY_MAX_SPLIT,
+            intra_batch_mode=False,
+        )
+        return tuple(
+            torch.empty(size, dtype=dtype, device=self.device) for size, dtype in info
+        )
+
+    def make_mla_native_verify_meta_data(
+        self, qo_indptr, kv_indptr, kv_last_page_len, buffers, max_q_len
+    ):
+        """Plan the native low-head verify schedule into buffers."""
+        (
+            work_metadata,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        ) = buffers
+        self.make_mla_meta_data(
+            qo_indptr,
+            kv_indptr,
+            kv_last_page_len,
+            work_metadata,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            max_q_len,
+            fast_mode=True,
+            max_split_per_batch=_MLA_NATIVE_VERIFY_MAX_SPLIT,
+            intra_batch_mode=False,
+            nhead_override=self.num_head,
+            dtype_q=self.input_dtype,
         )
 
     @property
@@ -2263,6 +2351,50 @@ class AiterAttnBackend(AttentionBackend):
             and is_gfx95_supported()
         )
 
+    def _select_mla_native_low_head_verify(self) -> bool:
+        """Whether target verify runs aiter's native low-head MLA kernel.
+
+        That kernel reads the real head count (4, 8 or 12 per rank), so the
+        query is not padded to 16 heads. It has its own schedule, so decode and
+        draft extend keep their kernels. "flydsl" asks for it; "asm" takes it
+        when the asm kernels have no kernel for the verify width.
+        """
+        q_len = self.num_draft_tokens
+        native = (
+            self.mla_verify_backend != "gluon"
+            and q_len is not None
+            and self.dcp_world_size <= 1
+            and self.num_head < 16
+            and get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
+            and (
+                self.mla_verify_backend == "flydsl"
+                or not self._asm_ps_supports_qlen(q_len)
+            )
+            and _aiter_mla_native_low_head_verify(
+                self.num_head, q_len, self.input_dtype, self.kv_cache_dtype
+            )
+        )
+        if self.mla_verify_backend == "flydsl" and not native:
+            logger.warning(
+                "SGLANG_AITER_MLA_VERIFY_BACKEND=flydsl: aiter has no native "
+                "persistent verify kernel for %d heads, %s draft tokens, %s Q "
+                "and %s KV with DCP %d; using the asm route.",
+                self.num_head,
+                q_len,
+                self.input_dtype,
+                self.kv_cache_dtype,
+                self.dcp_world_size,
+            )
+            self.mla_verify_backend = "asm"
+        elif native:
+            logger.info(
+                "aiter MLA target verify: native %d-head persistent kernel, "
+                "%d tokens per request, no head padding",
+                self.num_head,
+                q_len,
+            )
+        return native
+
     def _asm_cprr_supports_verify_shape(self, q_len: Optional[int]) -> bool:
         """Whether this topology has an asm cp kernel for DCP target verify."""
         return (
@@ -2274,6 +2406,49 @@ class AiterAttnBackend(AttentionBackend):
             and self.cprr_kernel_heads > 0
             and _asm_cprr_supports_shape(self.cprr_kernel_heads, q_len)
         )
+
+    def _forward_mla_native_verify(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        layer,
+        k_descale,
+    ) -> torch.Tensor:
+        """Target verify on aiter's native low-head kernel, at the real heads.
+
+        The kernel does not read masked KV rows, so row 0 needs no zeroing.
+        """
+        num_head = layer.tp_q_head_num
+        q = q.view(-1, num_head, layer.qk_head_dim)
+        if q.dtype != self.input_dtype:
+            raise RuntimeError(
+                f"native MLA verify was planned for a {self.input_dtype} query, "
+                f"got {q.dtype}"
+            )
+        o = q.new_empty((q.shape[0], num_head, layer.v_head_dim))
+        metadata = self.forward_metadata
+        mla_decode_fwd(
+            q,
+            k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+            o,
+            metadata.qo_indptr,
+            metadata.kv_indptr,
+            metadata.kv_indices,
+            metadata.kv_last_page_len,
+            metadata.max_q_len,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+            work_meta_data=metadata.work_metadata,
+            work_indptr=metadata.work_indptr,
+            work_info_set=metadata.work_info_set,
+            reduce_indptr=metadata.reduce_indptr,
+            reduce_final_map=metadata.reduce_final_map,
+            reduce_partial_map=metadata.reduce_partial_map,
+            kv_scale=k_descale,
+            intra_batch_mode=False,
+            num_kv_splits=metadata.num_kv_splits,
+        )
+        return o
 
     def _mla_decode_fwd_with_head_pad(
         self,
@@ -3302,7 +3477,26 @@ class AiterAttnBackend(AttentionBackend):
                     ) = self._build_dcp_verify_ragged_indices(
                         verify_token_table, local_kv_lens, bs, draft_num
                     )
-                if _use_mla_ps_kernel and (
+                if self.mla_native_low_head_verify:
+                    num_kv_splits = _MLA_NATIVE_VERIFY_MAX_SPLIT
+                    (
+                        work_metadata,
+                        work_indptr,
+                        work_info_set,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                    ) = buffers = self.make_mla_native_verify_meta_data_buffer(
+                        draft_num, bs
+                    )
+                    self.make_mla_native_verify_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        self.kv_last_page_len[:bs],
+                        buffers,
+                        draft_num,
+                    )
+                elif _use_mla_ps_kernel and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     max_seqlen_qo = draft_num
@@ -3889,6 +4083,12 @@ class AiterAttnBackend(AttentionBackend):
             self.reduce_final_map = None
             self.reduce_partial_map = None
 
+        self.native_verify_metadata = (
+            self.make_mla_native_verify_meta_data_buffer(self.num_draft_tokens, max_bs)
+            if self.use_mla and self.mla_native_low_head_verify
+            else None
+        )
+
         if self.use_sliding_window_kv_pool:
             self.cuda_graph_swa_page_table = torch.zeros(
                 (max_bs, self.max_num_pages),
@@ -4234,7 +4434,24 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and (
+                if self.mla_native_low_head_verify:
+                    num_kv_splits = _MLA_NATIVE_VERIFY_MAX_SPLIT
+                    self.make_mla_native_verify_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        kv_last_page_len,
+                        self.native_verify_metadata,
+                        max_q_len,
+                    )
+                    (
+                        work_metadata,
+                        work_indptr,
+                        work_info_set,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                    ) = self.native_verify_metadata
+                elif _use_mla_ps_kernel and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     num_kv_splits = self.max_split_per_batch
@@ -5024,6 +5241,10 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                if self.mla_native_low_head_verify:
+                    return self._forward_mla_native_verify(
+                        q, K_Buffer, layer, k_descale
+                    )
                 if prefer_mla_gluon_decode(
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),

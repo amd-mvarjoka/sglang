@@ -1,8 +1,9 @@
 """Gluon MLA decode wrapper for low head-count MLA (e.g. Kimi K3 TP8: 12 heads/GPU).
 
-Uses aiter ``mla_gluon`` when import succeeds and Triton Gluon exposes ``cga_layout``
-(needs Triton >= 3.7). Falls back to the caller (zero-pad + ``mla_decode_fwd``) when
-Gluon is unavailable.
+Uses aiter ``mla_gluon`` on gfx950 when import succeeds and Triton Gluon exposes
+``cga_layout`` (needs Triton >= 3.7). Falls back to the caller (zero-pad +
+``mla_decode_fwd``) when Gluon is unavailable, including on gfx942, where
+``mla_gluon`` asserts gfx950.
 
 Requires aiter ``main`` with ROCm/aiter #4480 (batch>1 ``bh16bn128``) and #4555
 (decode CUDA graph KV splits). SGLang probes import + Triton API only; aiter version
@@ -20,6 +21,7 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -32,6 +34,9 @@ def _gluon_fn():
     """aiter mla gluon entry point return None if disabled"""
     if not envs.SGLANG_AITER_MLA_GLUON.get():
         logger.info("aiter mla gluon is disabled manually.")
+        return None
+    if not is_gfx95_supported():
+        logger.info("aiter mla gluon is disabled: mla_gluon requires gfx950.")
         return None
     try:
         import triton
