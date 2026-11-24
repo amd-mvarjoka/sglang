@@ -9,7 +9,6 @@ import torch
 
 from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_indices
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
@@ -29,14 +28,14 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
     # A DFLASH draft never runs forward_decode, so its graphs skip the split-KV
     # decode partials (all heads under DCP: ~14.5 GiB a rank for K3.1's MLA5 draft).
     backend.runs_decode = not algorithm.is_dflash()
-    # The monokernel's DFLASH MLA draft verifies on its own tuned copy of the
-    # grouped-head kernel (a sliding window, two heads a tile); nothing else does.
+    # A DFLASH MLA draft verifies on its tuned copy of the grouped-head kernel (a
+    # sliding window, two heads a tile), with or without the monokernel; else its
+    # windowed block falls back to the per-head extend kernel.
     if (
         algorithm.is_dflash()
         and backend.use_mla
         and backend.topk == 1
         and is_gfx95_supported()
-        and get_exec().kernel.enable_amd_monokernel
         and model_runner.model_config.is_dflash_mla_draft
     ):
         from sglang.kernels.ops.attention.verify_mla_draft import verify_shared_kv_fwd

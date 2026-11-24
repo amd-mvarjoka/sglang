@@ -8,6 +8,8 @@ import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
 from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
+from sglang.kernels.ops.attention.verify_mla_draft import TARGET_PROGRAMS
+from sglang.kernels.ops.attention.verify_mla_draft import VerifyMLA as DraftVerifyMLA
 from sglang.kernels.ops.attention.verify_mla_draft import (
     verify_shared_kv_fwd as verify_draft_fwd,
 )
@@ -555,6 +557,79 @@ class TestDraftAttention(CustomTestCase):
                 backend = SimpleNamespace(use_mla=False, dcp_size=1)
                 init_draft_backend(backend, SimpleNamespace(spec_algorithm=algorithm))
                 assert backend.draft_bf16_dot is expected
+
+    @patch(
+        "sglang.srt.layers.attention.triton_draft_hip.is_gfx95_supported",
+        return_value=True,
+    )
+    def test_dflash_mla_kernel_does_not_require_monokernel(self, _is_gfx95_mock):
+        backend = SimpleNamespace(
+            use_mla=True,
+            topk=1,
+            dcp_size=1,
+            draft_bf16_dot=False,
+            runs_decode=True,
+        )
+        runner = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            model_config=SimpleNamespace(is_dflash_mla_draft=True),
+        )
+        init_draft_backend(backend, runner)
+        self.assertTrue(backend.draft_bf16_dot)
+        self.assertFalse(backend.runs_decode)
+        self.assertIsNotNone(backend.verify_mla_draft_fwd)
+
+    def test_large_batch_uses_more_prefix_splits(self):
+        verifier = object.__new__(DraftVerifyMLA)
+        verifier.n_head_blocks = 6
+        verifier.max_splits = 128
+        verifier.target_programs = TARGET_PROGRAMS
+        self.assertEqual(verifier._num_splits(16), 5)
+        self.assertEqual(verifier._num_splits(64), 4)
+
+    def test_tiny_bf16_dots_match_fp32_reference(self):
+        """A tiny one-row case keeps probability and split-partial rounding visible."""
+        torch.manual_seed(0)
+        prefix, d, dv = 7, 576, 512
+        scale, k_scale, v_scale = 192**-0.5, 0.7, 1.3
+        q = torch.randn(1, 1, d, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(1, 1, d, dtype=torch.bfloat16, device="cuda")
+        v = torch.randn(1, 1, dv, dtype=torch.bfloat16, device="cuda")
+        k_buffer = torch.randn(prefix + 3, 1, d, device="cuda").to(torch.float8_e4m3fn)
+        v_buffer = torch.randn(prefix + 3, 1, dv, device="cuda").to(torch.float8_e4m3fn)
+        kv_indices = torch.randperm(prefix + 3, device="cuda")[:prefix]
+        qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+        kv_indptr = torch.tensor([0, prefix], dtype=torch.int32, device="cuda")
+        actual = torch.empty(1, 1, dv, dtype=torch.bfloat16, device="cuda")
+
+        ran = verify_draft_fwd(
+            q, k, v, actual, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
+            None, True, None, 1, k_scale, v_scale,
+            sm_scale=scale, sliding_window_size=1024, max_bs=1, bf16_dot=True,
+        )  # fmt: skip
+        self.assertTrue(ran)
+
+        keys = torch.cat(
+            [
+                k_buffer[kv_indices.long(), 0].float() * k_scale,
+                k[0, 0].float().unsqueeze(0),
+            ]
+        )
+        values = torch.cat(
+            [
+                v_buffer[kv_indices.long(), 0].float() * v_scale,
+                v[0, 0].float().unsqueeze(0),
+            ]
+        )
+        probs = (keys @ q[0, 0].float() * scale).softmax(0)
+        expected = (probs @ values).to(torch.bfloat16)
+        torch.testing.assert_close(actual[0, 0], expected, atol=5e-3, rtol=5e-3)
+
+        error = actual.float() - expected.float()
+        scale_cosine = (error * expected.float()).sum().abs() / (
+            error.norm() * expected.float().norm()
+        ).clamp_min(1e-12)
+        self.assertLess(scale_cosine.item(), 0.1)
 
     def test_verify_matches_extend(self):
         cases = [

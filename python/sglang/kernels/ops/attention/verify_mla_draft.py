@@ -1,4 +1,4 @@
-"""Grouped-head split-KV verify for the gfx950 monokernel's DFLASH MLA draft.
+"""Grouped-head split-KV verify for the gfx950 DFLASH MLA draft.
 
 Specializes ``verify_mla.py`` for sliding windows and optional BF16 prefix dots
 over FP8 KV. Each program handles a group of query heads and the whole draft
@@ -71,7 +71,7 @@ def _verify_mla_prefix_stage1(
     qo_indptr,
     kv_indptr,
     kv_indices,
-    Att_Out,  # [BS, H_Q, MAX_N_SPLITS, L_EXT, Dv] bf16
+    Att_Out,  # [BS, H_Q, MAX_N_SPLITS, L_EXT, Dv] fp32
     Att_Lse,  # [BS, H_Q, MAX_N_SPLITS, L_EXT]     fp32
     num_splits,  # launched split count
     stride_qbs,
@@ -227,7 +227,14 @@ def _verify_mla_prefix_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            if BF16_DOT:
+                # Preserve the probability residual while keeping BF16 MFMA inputs.
+                p_hi = p.to(v.dtype)
+                p_lo = (p - p_hi.to(tl.float32)).to(v.dtype)
+                acc += tl.dot(p_hi, v)
+                acc += tl.dot(p_lo, v)
+            else:
+                acc += tl.dot(p.to(v.dtype), v)
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
 
@@ -514,10 +521,9 @@ class VerifyMLA:
         # (request, split) pairs a launch can need: bs x _num_splits(bs) peaks well
         # below max_bs x max_splits, so the partials are flat and viewed per call.
         pairs = max(bs * self._num_splits(bs) for bs in range(1, max_bs + 1))
-        # bf16 partials (halves scratch traffic vs fp32); lse stays fp32.
         self.att_out_flat = torch.empty(
             pairs * self.h_q * self.l_pad * self.v_head_dim,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
             device=self.device,
         )
         self.att_lse_flat = torch.empty(
@@ -527,7 +533,7 @@ class VerifyMLA:
     def _partials(self, bs, num_splits):
         """Views of the flat partials for one launch.
 
-        [bs, H_Q, num_splits, L_PAD, Dv] bf16 and [bs, H_Q, num_splits, L_PAD] fp32."""
+        [bs, H_Q, num_splits, L_PAD, Dv] fp32 and [bs, H_Q, num_splits, L_PAD] fp32."""
         n = bs * self.h_q * num_splits * self.l_pad
         att_out = self.att_out_flat[: n * self.v_head_dim].view(
             bs, self.h_q, num_splits, self.l_pad, self.v_head_dim
@@ -540,7 +546,10 @@ class VerifyMLA:
             self._alloc(max_bs)
 
     def _num_splits(self, bs):
-        budget = self.target_programs // max(1, bs * self.n_head_blocks)
+        tiles = max(1, bs * self.n_head_blocks)
+        # A larger split budget improved the measured large-batch draft cases.
+        programs = self.target_programs
+        budget = (3 * programs if tiles >= 128 else programs) // tiles
         return max(1, min(self.max_splits, budget))
 
     def _run_prefix_kernel(
