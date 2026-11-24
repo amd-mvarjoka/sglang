@@ -1,6 +1,6 @@
 """Kimi-K3's dense BF16 GEMMs that bypass UnquantizedLinearMethod, on ROCm: AITER's
-tuned table (or hipBLASLt where it is faster) and AITER's tuned FlyDSL kernel into
-caller storage. ``kimi_k3`` calls these behind ``_is_hip``."""
+tuned table (or hipBLASLt where it is faster) and AITER's tuned kernel into caller
+storage. ``kimi_k3`` calls these behind ``_is_hip``."""
 
 from typing import Optional
 
@@ -18,7 +18,7 @@ def k3_bf16_gemm_hip(
 ) -> Optional[torch.Tensor]:
     """_k3_bf16_gemm's ROCm routing: the shapes AITER's bf16 table tunes (and
     hipBLASLt does not run faster) through AITER, and an out= GEMM through AITER's
-    tuned FlyDSL kernel; None leaves the GEMM to torch (hipBLASLt)."""
+    tuned kernel (a16w16_into); None leaves the GEMM to torch (hipBLASLt)."""
     if out is None:
         return a16w16_tgemm(x, weight)
     return out if a16w16_into(x, weight, out) else None

@@ -1,6 +1,6 @@
 """gfx950 BF16 GEMM routing under AITER for UnquantizedLinearMethod and the GEMMs that
 bypass it (Kimi-K3's, the DCP q-replicate q_b): the shapes hipBLASLt takes from AITER's
-tuned table, and AITER's tuned FlyDSL kernel straight into caller storage."""
+tuned table, and AITER's tuned kernel straight into caller storage."""
 
 import functools
 from typing import Optional
@@ -31,6 +31,17 @@ def a16w16_is_tuned(m: int, n: int, k: int, has_bias: bool) -> bool:
         )
         is not None
     )
+
+
+@functools.lru_cache(maxsize=4096)
+def _a16w16_tuned_libtype(m: int, n: int, k: int) -> Optional[str]:
+    """The library AITER's bf16 table picked for this bf16-output shape, if tuned."""
+    from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config
+
+    config = get_GEMM_A16W16_tuned_config(
+        m, n, k, False, str(torch.bfloat16), str(torch.bfloat16)
+    )
+    return None if config is None else config["libtype"]
 
 
 @functools.lru_cache(maxsize=4096)
@@ -78,13 +89,13 @@ def prefer_hipblaslt(m: int, n: int, k: int) -> bool:
 
 
 def a16w16_into(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> bool:
-    """Run AITER's tuned FlyDSL bf16 GEMM for this shape straight into ``out``.
+    """Run AITER's tuned bf16 GEMM for this shape straight into ``out``.
 
-    tgemm.mm cannot write caller storage or an fp32 output, and copies a
-    row-strided input, so such GEMMs otherwise fall back to hipBLASLt. ``x``
-    may be a row slice of a wider buffer; ``out`` is contiguous bf16 or fp32
-    (the tile tuned for bf16 output). Returns False when the tuned kernel is
-    not FlyDSL or the operands do not fit it.
+    A bf16 ``out`` whose tuned row names another library goes through
+    tgemm.mm(out=); otherwise the FlyDSL tile tuned for bf16 output runs, also
+    for an fp32 ``out``, which the table keys separately and rarely tunes.
+    ``x`` may be a row slice of a wider buffer; ``out`` is contiguous bf16 or
+    fp32. Returns False when no tuned kernel fits, leaving it to hipBLASLt.
     """
     if not (
         _use_aiter
@@ -102,7 +113,14 @@ def a16w16_into(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> boo
         and not prefer_hipblaslt(x.shape[0], weight.shape[0], weight.shape[1])
     ):
         return False
-    launch = _a16w16_flydsl_launch(x.shape[0], weight.shape[0], weight.shape[1])
+    m, n, k = x.shape[0], weight.shape[0], weight.shape[1]
+    libtype = _a16w16_tuned_libtype(m, n, k) if out.dtype == torch.bfloat16 else None
+    if libtype not in (None, "flydsl"):
+        from aiter.tuned_gemm import tgemm
+
+        tgemm.mm(x, weight, otype=out.dtype, out=out)
+        return True
+    launch = _a16w16_flydsl_launch(m, n, k)
     if launch is None:
         return False
     from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import gemm_a16w16
@@ -120,7 +138,7 @@ def a16w16_into(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> boo
 
 
 def a16w16_tuned(x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
-    """``x @ weight.T`` through AITER's tuned FlyDSL kernel, else None."""
+    """``x @ weight.T`` through AITER's tuned kernel (a16w16_into), else None."""
     out = x.new_empty((x.shape[0], weight.shape[0]))
     return out if a16w16_into(x, weight, out) else None
 
