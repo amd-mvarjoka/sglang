@@ -612,13 +612,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # The monokernel's K3.1 indexer (no rope, its own projections): the paged
         # logits with their histogram and the top-k in one launch (gfx950), and the
-        # index-K store applying k_norm itself (dsa_indexer_hip).
-        self._mono_k31 = (
-            _use_aiter
-            and _use_aiter_preshuffle
-            and self.skip_rope
-            and get_exec().kernel.enable_amd_monokernel
-        )
+        # index-K store applying k_norm itself (dsa_indexer_hip), with or without
+        # --enable-amd-monokernel.
+        self._mono_k31 = _use_aiter and _use_aiter_preshuffle and self.skip_rope
         self._hist_topk = (
             dsa_indexer_hip.hist_topk_workspace(self, config)
             if self._mono_k31 and not self.use_gfx950_fused_indexer

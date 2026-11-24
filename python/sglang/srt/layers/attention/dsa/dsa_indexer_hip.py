@@ -142,7 +142,7 @@ def verify_paged_mqa_logits(
     )
 
 
-# ---- the monokernel's K3.1 indexer (--enable-amd-monokernel, gfx950, no rope)
+# ---- the monokernel's K3.1 indexer (gfx950, no rope)
 
 
 def hist_topk_workspace(indexer, config):
